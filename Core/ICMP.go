@@ -48,42 +48,39 @@ func CheckLive(hostslist []string, Ping bool) []string {
 	return AliveHosts
 }
 
-// IsContain 检查切片中是否包含指定元素
-func IsContain(items []string, item string) bool {
-	for _, eachItem := range items {
-		if eachItem == item {
-			return true
-		}
-	}
-	return false
-}
-
 func handleAliveHosts(chanHosts chan string, hostslist []string, isPing bool) {
+	hostMap := make(map[string]struct{}, len(hostslist))
+	for _, h := range hostslist {
+		hostMap[h] = struct{}{}
+	}
+
 	for ip := range chanHosts {
-		if _, ok := ExistHosts[ip]; !ok && IsContain(hostslist, ip) {
-			ExistHosts[ip] = struct{}{}
-			AliveHosts = append(AliveHosts, ip)
+		if _, isTargetHost := hostMap[ip]; isTargetHost { // Check if the IP is part of the initial target list
+			if _, alreadyProcessed := ExistHosts[ip]; !alreadyProcessed { // Check if we haven't processed this IP yet
+				ExistHosts[ip] = struct{}{}
+				AliveHosts = append(AliveHosts, ip)
 
-			// 使用Output系统保存存活主机信息
-			protocol := "ICMP"
-			if isPing {
-				protocol = "PING"
-			}
+				// 使用Output系统保存存活主机信息
+				protocol := "ICMP"
+				if isPing {
+					protocol = "PING"
+				}
 
-			result := &Common.ScanResult{
-				Time:   time.Now(),
-				Type:   Common.HOST,
-				Target: ip,
-				Status: "alive",
-				Details: map[string]interface{}{
-					"protocol": protocol,
-				},
-			}
-			Common.SaveResult(result)
+				result := &Common.ScanResult{
+					Time:   time.Now(),
+					Type:   Common.HOST,
+					Target: ip,
+					Status: "alive",
+					Details: map[string]interface{}{
+						"protocol": protocol,
+					},
+				}
+				Common.SaveResult(result)
 
-			// 保留原有的控制台输出
-			if !Common.Silent {
-				Common.LogInfo(Common.GetText("target_alive", ip, protocol))
+				// 保留原有的控制台输出
+				if !Common.Silent {
+					Common.LogInfo(Common.GetText("target_alive", ip, protocol))
+				}
 			}
 		}
 		livewg.Done()
@@ -191,35 +188,39 @@ func RunIcmp1(hostslist []string, conn *icmp.PacketConn, chanHosts chan string) 
 
 // RunIcmp2 使用ICMP并发探测主机存活(无监听模式)
 func RunIcmp2(hostslist []string, chanHosts chan string) {
-	// 控制并发数
-	num := 1000
-	if len(hostslist) < num {
-		num = len(hostslist)
+	workerNum := 1000
+	if len(hostslist) < workerNum {
+		workerNum = len(hostslist)
+	}
+	if workerNum == 0 { // handle case of empty hostslist
+		return
 	}
 
 	var wg sync.WaitGroup
-	limiter := make(chan struct{}, num)
+	tasks := make(chan string, len(hostslist))
 
-	// 并发探测
-	for _, host := range hostslist {
-		wg.Add(1)
-		limiter <- struct{}{}
-		icmpRateLimiter.Wait(context.Background()) // Apply rate limiting before starting goroutine
-		go func(host string) {
-			defer func() {
-				<-limiter
-				wg.Done()
-			}()
-
-			if icmpalive(host) {
-				livewg.Add(1)
-				chanHosts <- host
+	// Start worker goroutines
+	for i := 0; i < workerNum; i++ {
+		wg.Add(1) // Add to the main waitgroup for each worker before it starts
+		go func() {
+			defer wg.Done() // Worker is done
+			for host := range tasks {
+				// The icmpalive function itself handles rate limiting.
+				if icmpalive(host) {
+					livewg.Add(1) // Add to livewg for each live host found
+					chanHosts <- host
+				}
 			}
-		}(host)
+		}()
 	}
 
-	wg.Wait()
-	close(limiter)
+	// Send tasks to workers
+	for _, host := range hostslist {
+		tasks <- host
+	}
+	close(tasks) // Close tasks channel to signal no more tasks
+
+	wg.Wait() // Wait for all workers to finish
 }
 
 // icmpalive 检测主机ICMP是否存活
@@ -257,28 +258,39 @@ func icmpalive(host string) bool {
 // RunPing 使用系统Ping命令并发探测主机存活
 func RunPing(hostslist []string, chanHosts chan string) {
 	var wg sync.WaitGroup
-	// 限制并发数为50
-	limiter := make(chan struct{}, 50)
-
-	// 并发探测
-	for _, host := range hostslist {
-		wg.Add(1)
-		limiter <- struct{}{}
-
-		go func(host string) {
-			defer func() {
-				<-limiter
-				wg.Done()
-			}()
-
-			if ExecCommandPing(host) {
-				livewg.Add(1)
-				chanHosts <- host
-			}
-		}(host)
+	workerNum := 50 // Default similar to old limiter
+	if len(hostslist) < workerNum {
+		workerNum = len(hostslist)
+	}
+	if workerNum == 0 { // handle case of empty hostslist
+		return
 	}
 
-	wg.Wait()
+	tasks := make(chan string, len(hostslist))
+
+	// Start worker goroutines
+	for i := 0; i < workerNum; i++ {
+		wg.Add(1) // Add to the main waitgroup for each worker
+		go func() {
+			defer wg.Done() // Worker is done
+			// Ensure "context" is imported for icmpRateLimiter.Wait (already imported)
+			for host := range tasks {
+				icmpRateLimiter.Wait(context.Background()) // Apply rate limiting before executing ping
+				if ExecCommandPing(host) {
+					livewg.Add(1) // Add to livewg for each live host found
+					chanHosts <- host
+				}
+			}
+		}()
+	}
+
+	// Send tasks to workers
+	for _, host := range hostslist {
+		tasks <- host
+	}
+	close(tasks) // Close tasks channel to signal no more tasks
+
+	wg.Wait() // Wait for all workers to finish
 }
 
 // ExecCommandPing 执行系统Ping命令检测主机存活

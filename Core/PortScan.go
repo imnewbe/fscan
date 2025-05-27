@@ -13,15 +13,21 @@ import (
 	"time"
 )
 
-var fingerprintSem *semaphore.Weighted
+var fingerprintSem *semaphore.Weighted // This is already here
+
+// Define the new struct for results and logs
+type ResultLogItem struct {
+    Result     *Common.ScanResult
+    LogMessage string
+    IsErrorLog bool // Though current usage is for LogInfo, future might use it for errors
+}
 
 // EnhancedPortScan 高性能端口扫描函数
 func EnhancedPortScan(hosts []string, ports string, timeout int64) []string {
 	fingerprintSem = semaphore.NewWeighted(int64(50))
-	// 解析端口和排除端口
 	portList := Common.ParsePort(ports)
 	if len(portList) == 0 {
-		Common.LogError("无效端口: " + ports)
+		Common.LogError("无效端口: " + ports) // This LogError can remain direct
 		return nil
 	}
 
@@ -30,135 +36,146 @@ func EnhancedPortScan(hosts []string, ports string, timeout int64) []string {
 		exclude[p] = struct{}{}
 	}
 
-	// 初始化并发控制
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	to := time.Duration(timeout) * time.Second
 	sem := semaphore.NewWeighted(int64(Common.ThreadNum))
 	var count int64
-	var aliveMap sync.Map
+	var aliveMap sync.Map // This is for the final return list, keep it.
 	g, ctx := errgroup.WithContext(ctx)
 
-	// 并发扫描所有目标
-	for _, host := range hosts {
-		for _, port := range portList {
-			if _, excluded := exclude[port]; excluded {
+    // 1. Define result channel
+    resultsChan := make(chan ResultLogItem, 200) // Use the new struct
+
+    // 2. Start result processing goroutine
+    var resultWg sync.WaitGroup
+    resultWg.Add(1)
+    go func() {
+        defer resultWg.Done()
+        for item := range resultsChan {
+            if item.Result != nil {
+                Common.SaveResult(item.Result)
+            }
+            if item.LogMessage != "" {
+                // Assuming IsErrorLog is false for these specific logs as per current direct calls
+                // if item.IsErrorLog { Common.LogError(item.LogMessage) } else { Common.LogInfo(item.LogMessage) }
+                Common.LogInfo(item.LogMessage)
+            }
+        }
+    }()
+
+	// Main scanning loop (for _, host := range hosts)
+	for _, hostLoopVar := range hosts {
+		for _, portLoopVar := range portList {
+			if _, excluded := exclude[portLoopVar]; excluded {
 				continue
 			}
 
-			host, port := host, port // 捕获循环变量
-			addr := fmt.Sprintf("%s:%d", host, port)
+            // Capture loop variables for goroutine
+            currentHost := hostLoopVar
+            currentPort := portLoopVar
+            currentAddr := fmt.Sprintf("%s:%d", currentHost, currentPort)
 
 			if err := sem.Acquire(ctx, 1); err != nil {
-				break
-			}
+                // Error acquiring semaphore, break the inner loop for this host
+                Common.LogError(fmt.Sprintf("Failed to acquire semaphore for %s: %v", currentAddr, err))
+                break 
+            }
 
 			g.Go(func() error {
 				defer sem.Release(1)
 
-				// 连接测试
-				conn, err := net.DialTimeout("tcp", addr, to)
+				conn, err := net.DialTimeout("tcp", currentAddr, to)
 				if err != nil {
-					return nil
+					return nil // Error handled by not proceeding
 				}
 				defer conn.Close()
 
-				// 记录开放端口
 				atomic.AddInt64(&count, 1)
-				aliveMap.Store(addr, struct{}{})
-				Common.LogInfo("端口开放 " + addr)
-				Common.SaveResult(&Common.ScanResult{
-					Time: time.Now(), Type: Common.PORT, Target: host,
-					Status: "open", Details: map[string]interface{}{"port": port},
-				})
+				aliveMap.Store(currentAddr, struct{}{}) // Keep aliveMap for return value
 
-				// 服务识别
+                // 3. Modify scanning goroutines to send to resultsChan
+                portOpenLogMsg := fmt.Sprintf("端口开放 %s", currentAddr)
+                resultsChan <- ResultLogItem{
+                    Result: &Common.ScanResult{
+                        Time:   time.Now(),
+                        Type:   Common.PORT,
+                        Target: currentHost, 
+                        Status: "open",
+                        Details: map[string]interface{}{"port": currentPort}, 
+                    },
+                    LogMessage: portOpenLogMsg,
+                    IsErrorLog: false,
+                }
+
 				if Common.EnableFingerprint {
-					// Try to acquire the fingerprinting semaphore
 					if err := fingerprintSem.Acquire(ctx, 1); err != nil {
-						Common.LogError(fmt.Sprintf("Fingerprint scan skipped for %s:%d due to semaphore acquisition failure: %v", host, port, err))
+                        Common.LogError(fmt.Sprintf("Fingerprint scan skipped for %s:%d due to semaphore acquisition failure: %v", currentHost, currentPort, err))
 					} else {
-						// IMPORTANT: Defer the release only if acquisition was successful
 						defer fingerprintSem.Release(1)
+						if info, err := NewPortInfoScanner(currentHost, currentPort, conn, to).Identify(); err == nil {
+                            details := map[string]interface{}{"port": currentPort, "service": info.Name}
+                            if info.Version != "" { details["version"] = info.Version }
+                            for k, v := range info.Extras {
+                                if v == "" { continue }
+                                switch k {
+                                case "vendor_product": details["product"] = v
+                                case "os", "info": details[k] = v
+                                }
+                            }
+                            if len(info.Banner) > 0 { details["banner"] = strings.TrimSpace(info.Banner) }
 
-						// Original fingerprinting logic starts here
-						if info, err := NewPortInfoScanner(host, port, conn, to).Identify(); err == nil {
-							// 构建结果详情
-							details := map[string]interface{}{"port": port, "service": info.Name}
-							if info.Version != "" {
-								details["version"] = info.Version
-							}
+                            var sb strings.Builder
+                            sb.WriteString(fmt.Sprintf("服务识别 %s => ", currentAddr))
+                            if info.Name != "unknown" { sb.WriteString("[" + info.Name + "]") }
+                            if info.Version != "" { sb.WriteString(" 版本:" + info.Version) }
+                            for k, v := range info.Extras {
+                                if v == "" { continue }
+                                switch k {
+                                case "vendor_product": sb.WriteString(" 产品:" + v)
+                                case "os": sb.WriteString(" 系统:" + v)
+                                case "info": sb.WriteString(" 信息:" + v)
+                                }
+                            }
+                            if len(info.Banner) > 0 && len(info.Banner) < 100 {
+                                sb.WriteString(" Banner:[" + strings.TrimSpace(info.Banner) + "]")
+                            }
+                            serviceLogMsg := sb.String()
 
-							// 处理额外信息
-							for k, v := range info.Extras {
-								if v == "" {
-									continue
-								}
-								switch k {
-								case "vendor_product":
-									details["product"] = v
-								case "os", "info":
-									details[k] = v
-								}
-							}
-							if len(info.Banner) > 0 {
-								details["banner"] = strings.TrimSpace(info.Banner)
-							}
-
-							// 保存服务结果
-							Common.SaveResult(&Common.ScanResult{
-								Time: time.Now(), Type: Common.SERVICE, Target: host,
-								Status: "identified", Details: details,
-							})
-
-							// 记录服务信息
-							var sb strings.Builder
-							sb.WriteString("服务识别 " + addr + " => ")
-							if info.Name != "unknown" {
-								sb.WriteString("[" + info.Name + "]")
-							}
-							if info.Version != "" {
-								sb.WriteString(" 版本:" + info.Version)
-							}
-
-							for k, v := range info.Extras {
-								if v == "" {
-									continue
-								}
-								switch k {
-								case "vendor_product":
-									sb.WriteString(" 产品:" + v)
-								case "os":
-									sb.WriteString(" 系统:" + v)
-								case "info":
-									sb.WriteString(" 信息:" + v)
-								}
-							}
-
-							if len(info.Banner) > 0 && len(info.Banner) < 100 {
-								sb.WriteString(" Banner:[" + strings.TrimSpace(info.Banner) + "]")
-							}
-
-							Common.LogInfo(sb.String())
+                            resultsChan <- ResultLogItem{
+                                Result: &Common.ScanResult{
+                                    Time:   time.Now(),
+                                    Type:   Common.SERVICE,
+                                    Target: currentHost, 
+                                    Status: "identified",
+                                    Details: details,
+                                },
+                                LogMessage: serviceLogMsg,
+                                IsErrorLog: false,
+                            }
 						}
-						// Note: If NewPortInfoScanner().Identify() itself returns an error, it's handled by its own 'if err == nil'
 					}
 				}
-
 				return nil
-			})
-		}
-	}
+			}) // End of g.Go
+		} // End of port loop
+	} // End of host loop
 
-	_ = g.Wait()
+	if err := g.Wait(); err != nil {
+        // Log error from errgroup if any non-nil error is returned by a goroutine
+        Common.LogError(fmt.Sprintf("Error during port scanning: %v", err))
+    }
 
-	// 收集结果
+    // 4. Ensure proper shutdown
+    close(resultsChan)
+    resultWg.Wait()
+
 	var aliveAddrs []string
 	aliveMap.Range(func(key, _ interface{}) bool {
 		aliveAddrs = append(aliveAddrs, key.(string))
 		return true
 	})
 
-	Common.LogBase(fmt.Sprintf("扫描完成, 发现 %d 个开放端口", count))
+	Common.LogBase(fmt.Sprintf("扫描完成, 发现 %d 个开放端口", count)) // This LogBase can remain direct
 	return aliveAddrs
 }
