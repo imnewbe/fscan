@@ -2,9 +2,11 @@ package Core
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"github.com/shadow1ng/fscan/Common"
 	"golang.org/x/net/icmp"
+	"golang.org/x/time/rate"
 	"net"
 	"os/exec"
 	"runtime"
@@ -14,7 +16,8 @@ import (
 )
 
 var (
-	AliveHosts []string                    // 存活主机列表
+	icmpRateLimiter = rate.NewLimiter(rate.Limit(100), 1) // Rate limiter for ICMP packets
+	AliveHosts      []string                               // 存活主机列表
 	ExistHosts = make(map[string]struct{}) // 已发现主机记录
 	livewg     sync.WaitGroup              // 存活检测等待组
 )
@@ -158,6 +161,7 @@ func RunIcmp1(hostslist []string, conn *icmp.PacketConn, chanHosts chan string) 
 	for _, host := range hostslist {
 		dst, _ := net.ResolveIPAddr("ip", host)
 		IcmpByte := makemsg(host)
+		icmpRateLimiter.Wait(context.Background()) // Apply rate limiting
 		conn.WriteTo(IcmpByte, dst)
 	}
 
@@ -200,7 +204,7 @@ func RunIcmp2(hostslist []string, chanHosts chan string) {
 	for _, host := range hostslist {
 		wg.Add(1)
 		limiter <- struct{}{}
-
+		icmpRateLimiter.Wait(context.Background()) // Apply rate limiting before starting goroutine
 		go func(host string) {
 			defer func() {
 				<-limiter
@@ -236,6 +240,7 @@ func icmpalive(host string) bool {
 
 	// 构造并发送ICMP请求
 	msg := makemsg(host)
+	icmpRateLimiter.Wait(context.Background()) // Apply rate limiting
 	if _, err := conn.Write(msg); err != nil {
 		return false
 	}
